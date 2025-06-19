@@ -1,0 +1,43 @@
+name: Update README Stats
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # 매주 일요일 자정에 실행
+  workflow_dispatch:     # 수동 실행 가능
+
+jobs:
+  update-readme:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Generate analysis report
+      run: |
+        python run_tco_analysis.py
+        
+    - name: Update README with latest results
+      run: |
+        echo "<!-- AUTO-GENERATED RESULTS -->" >> README.md
+        echo "## 📊 최근 분석 결과" >> README.md
+        echo "**업데이트:** $(date)" >> README.md
+        echo "" >> README.md
+        
+    - name: Commit changes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add README.md
+        git diff --staged --quiet || git commit -m "Auto-update README with latest analysis results"
+        git push 
