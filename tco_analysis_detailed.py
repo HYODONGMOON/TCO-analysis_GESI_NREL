@@ -58,6 +58,9 @@ class SegmentSalesAnalyzer:
             'E2': '대형SUV'
         }
         
+        # 소유 기간 설정
+        self.ownership_years = 5
+        
         # 결과 저장 폴더 생성
         self.create_results_folder()
     
@@ -177,33 +180,33 @@ class SegmentSalesAnalyzer:
         for scenario_name, scenario_params in scenarios.items():
             print(f"\n📊 시나리오: {scenario_name}")
             
-            # 시나리오별 TCO 수정
-            modified_data = segment_data.copy()
+            # 각 시나리오는 해당 시트의 데이터를 사용
+            scenario_data = scenario_params['scenario_data']
             
-            for idx, row in modified_data.iterrows():
-                original_tco = row['TCO_만원']
-                vehicle_type = row['차량유형']
+            # 세그먼트에 해당하는 차량들만 필터링
+            segment_vehicles = segment_data['차량명'].tolist()
+            
+            # 컬럼명 확인 및 필터링
+            vehicle_column = None
+            for col in scenario_data.columns:
+                if '소분류' in col or '차량명' in col or '모델' in col:
+                    vehicle_column = col
+                    break
+            
+            if vehicle_column is None:
+                print(f"⚠️ {scenario_name}에서 차량명 컬럼을 찾을 수 없습니다.")
+                print(f"🔍 사용 가능한 컬럼: {list(scenario_data.columns)}")
+                modified_data = segment_data.copy()
+            else:
+                scenario_segment_data = scenario_data[scenario_data[vehicle_column].isin(segment_vehicles)].copy()
                 
-                # 시나리오별 TCO 변화 적용
-                if 'ICE_cost_increase' in scenario_params:
-                    if vehicle_type == 'ICE':
-                        modified_data.at[idx, 'TCO_만원'] = original_tco * (1 + scenario_params['ICE_cost_increase'])
-                
-                if 'BEV_cost_decrease' in scenario_params:
-                    if vehicle_type == 'BEV':
-                        modified_data.at[idx, 'TCO_만원'] = original_tco * (1 - scenario_params['BEV_cost_decrease'])
-                
-                if 'fuel_price_increase' in scenario_params:
-                    if vehicle_type == 'ICE':
-                        # 연료비 증가로 인한 TCO 변화 (연간연료비의 20%가 TCO에 영향)
-                        fuel_impact = original_tco * 0.2 * scenario_params['fuel_price_increase']
-                        modified_data.at[idx, 'TCO_만원'] = original_tco + fuel_impact
-                
-                if 'subsidy_increase' in scenario_params:
-                    if vehicle_type == 'BEV':
-                        # 보조금 증가로 인한 TCO 감소
-                        subsidy_impact = original_tco * scenario_params['subsidy_increase']
-                        modified_data.at[idx, 'TCO_만원'] = original_tco - subsidy_impact
+                if scenario_segment_data.empty:
+                    print(f"⚠️ {scenario_name}에서 해당 세그먼트 차량을 찾을 수 없습니다.")
+                    modified_data = segment_data.copy()
+                else:
+                    print(f"✅ {scenario_name}에서 {len(scenario_segment_data)}개 차량 데이터 찾음")
+                    # 해당 시나리오의 데이터를 사용하여 TCO 재계산
+                    modified_data = self.calculate_scenario_tco(scenario_segment_data)
             
             # 수정된 TCO로 선택 확률 매트릭스 재계산
             probability_matrix, vehicles = self.calculate_choice_probability_matrix(modified_data)
@@ -223,6 +226,31 @@ class SegmentSalesAnalyzer:
             print(f"✅ {scenario_name} 시나리오 완료")
         
         return results
+    
+    def calculate_scenario_tco(self, scenario_data):
+        """시나리오 데이터로 TCO 재계산"""
+        modified_data = scenario_data.copy()
+        if '소분류' in modified_data.columns and '차량명' not in modified_data.columns:
+            modified_data = modified_data.rename(columns={'소분류': '차량명'})
+        for idx, row in modified_data.iterrows():
+            initial_cost = row['구매비용_만원'] - row['보조금_만원']
+            annual_fuel = row['연간연료비_만원']
+            annual_maintenance = row['연간유지보수비_만원']
+            annual_tax_insurance = row['연간세금보험_만원']
+            annual_depreciation = row['연간감가상각_만원']
+            annual_other = row['연간기타비용_만원'] if pd.notna(row['연간기타비용_만원']) else 0
+            annual_operating_cost = annual_fuel + annual_maintenance + annual_tax_insurance + annual_other
+            total_operating_cost = annual_operating_cost * self.ownership_years
+            residual_rate = row['잔존가치율'] if pd.notna(row['잔존가치율']) else 0.3
+            residual_value = initial_cost * residual_rate
+            total_tco = initial_cost + total_operating_cost - residual_value
+            modified_data.at[idx, 'TCO_만원'] = total_tco
+            modified_data.at[idx, '초기투자비용_만원'] = initial_cost
+            modified_data.at[idx, '연간운영비_만원'] = annual_operating_cost
+            modified_data.at[idx, '총운영비_만원'] = total_operating_cost
+            modified_data.at[idx, '잔존가치_만원'] = residual_value
+            modified_data.at[idx, '연평균TCO_만원'] = total_tco / self.ownership_years
+        return modified_data
     
     def calculate_market_share_changes(self, original_data, modified_data, probability_matrix):
         """시장점유율 변화 계산"""
@@ -281,7 +309,18 @@ class SegmentSalesAnalyzer:
             modified_tco = result['modified_data']['TCO_만원'].values
             scenario_data.append(modified_tco)
         
-        scenario_data = np.array(scenario_data)
+        # 배열 길이 통일
+        max_length = max(len(data) for data in scenario_data)
+        scenario_data_padded = []
+        for data in scenario_data:
+            if len(data) < max_length:
+                # 부족한 길이만큼 0으로 패딩
+                padded_data = np.pad(data, (0, max_length - len(data)), 'constant', constant_values=0)
+                scenario_data_padded.append(padded_data)
+            else:
+                scenario_data_padded.append(data)
+        
+        scenario_data = np.array(scenario_data_padded)
         
         for i, vehicle in enumerate(vehicles):
             ax2.plot(scenario_names, scenario_data[:, i], marker='o', label=vehicle)
@@ -324,11 +363,13 @@ class SegmentSalesAnalyzer:
             bev_total = 0
             ice_total = 0
             
+            # 배열 길이 확인 및 안전한 인덱싱
             for i, vehicle_type in enumerate(modified_data['차량유형']):
-                if vehicle_type == 'BEV':
-                    bev_total += modified_shares[i]
-                else:
-                    ice_total += modified_shares[i]
+                if i < len(modified_shares):  # 배열 범위 확인
+                    if vehicle_type == 'BEV':
+                        bev_total += modified_shares[i]
+                    else:
+                        ice_total += modified_shares[i]
             
             bev_shares.append(bev_total)
             ice_shares.append(ice_total)
@@ -377,11 +418,26 @@ class DetailedTCOAnalyzer:
     def load_data(self):
         """Load Excel data"""
         try:
-            self.data = pd.read_excel(self.excel_path, sheet_name='차량분류')
-            self.scenario_data = pd.read_excel(self.excel_path, sheet_name='지원제거시나리오')
-            self.yearly_data = pd.read_excel(self.excel_path, sheet_name='연도별TCO')
+            self.data = pd.read_excel(self.excel_path, sheet_name='기본시나리오')
+            # 시나리오 시트 자동 탐색 (시트명에 "시나리오"가 포함된 시트만)
+            xl = pd.ExcelFile(self.excel_path)
+            scenario_sheets = [s for s in xl.sheet_names if '시나리오' in s]
+            self.scenarios = {}
+            for sheet in scenario_sheets:
+                self.scenarios[sheet] = pd.read_excel(self.excel_path, sheet_name=sheet)
+                print(f"✅ {sheet} 데이터 로드 완료")
+            # 기존 데이터도 로드 (호환성 유지)
+            try:
+                self.scenario_data = pd.read_excel(self.excel_path, sheet_name='지원제거시나리오')
+            except:
+                self.scenario_data = None
+            try:
+                self.yearly_data = pd.read_excel(self.excel_path, sheet_name='연도별TCO')
+            except:
+                self.yearly_data = None
             print("✅ Data loaded successfully.")
             print(f"📊 Total {len(self.data)} vehicle models analyzed")
+            print(f"📊 Loaded scenarios: {list(self.scenarios.keys())}")
             return True
         except FileNotFoundError:
             print(f"❌ File not found: {self.excel_path}")
@@ -450,76 +506,55 @@ class DetailedTCOAnalyzer:
         print("\n" + "="*60)
         print("🚗 세그먼트별 판매량 변화 분석")
         print("="*60)
-        
         # TCO 계산
         self.calculate_all_tco()
-        
         # 실제 데이터에서 사용 가능한 세그먼트들 확인
         available_segments = self.data['중분류'].unique()
         print(f"📊 사용 가능한 세그먼트: {list(available_segments)}")
-        
-        # 시나리오 정의
-        scenarios = {
-            '기본시나리오': {},
-            'ICE_비용증가_10%': {'ICE_cost_increase': 0.10},
-            'BEV_비용감소_15%': {'BEV_cost_decrease': 0.15},
-            '연료가격_20%상승': {'fuel_price_increase': 0.20},
-            'BEV_보조금_증가': {'subsidy_increase': 0.10},
-            '종합시나리오': {
-                'ICE_cost_increase': 0.05,
-                'BEV_cost_decrease': 0.10,
-                'fuel_price_increase': 0.15,
-                'subsidy_increase': 0.05
-            }
-        }
-        
+        # 시나리오 정의 (차량분류 = 기본시나리오, 나머지 = 변화된 시나리오)
+        scenarios = {'기본시나리오': {'scenario_data': self.data}}
+        # 엑셀에서 로드된 시나리오 추가
+        for scenario_name, scenario_data in self.scenarios.items():
+            scenarios[scenario_name] = {'scenario_data': scenario_data}
+        print(f"📊 분석할 시나리오: {list(scenarios.keys())}")
         segment_results = {}
-        
         # 각 세그먼트별 분석
         for segment in available_segments:
             segment_name = self.segment_analyzer.segments.get(segment, segment)
             print(f"\n📊 {segment_name} ({segment}) 세그먼트 분석 중...")
-            
             # 세그먼트 내 차량 데이터 추출
             segment_data = self.segment_analyzer.get_segment_data(self.data, segment)
-            
             if not segment_data.empty:
                 print(f"  ✅ {len(segment_data)}개 차량 모델 발견:")
                 for _, vehicle in segment_data.iterrows():
                     print(f"    • {vehicle['차량명']} ({vehicle['차량유형']}) - TCO: {vehicle['TCO_만원']:,.0f}만원")
-                
                 # 시나리오별 시뮬레이션
                 results = self.segment_analyzer.simulate_tco_scenarios(segment_data, scenarios)
                 segment_results[segment] = results
-                
                 # 시각화
                 self.segment_analyzer.plot_segment_analysis(results, f"{segment}_{segment_name}")
-                
                 # 결과 출력
                 print(f"\n📈 {segment_name} 세그먼트 결과 요약:")
                 original_bev = sum(segment_data[segment_data['차량유형'] == 'BEV']['현재시장점유율'])
                 original_ice = sum(segment_data[segment_data['차량유형'] == 'ICE']['현재시장점유율'])
                 print(f"  • 원본 BEV 점유율: {original_bev:.1%}")
                 print(f"  • 원본 ICE 점유율: {original_ice:.1%}")
-                
                 for result in results:
                     scenario_name = result['scenario']
                     modified_data = result['modified_data']
                     market_shares = result['market_shares']
-                    
                     modified_bev = 0
                     modified_ice = 0
                     for i, vehicle_type in enumerate(modified_data['차량유형']):
-                        if vehicle_type == 'BEV':
-                            modified_bev += market_shares[i]
-                        else:
-                            modified_ice += market_shares[i]
-                    
+                        if i < len(market_shares):
+                            if vehicle_type == 'BEV':
+                                modified_bev += market_shares[i]
+                            else:
+                                modified_ice += market_shares[i]
                     bev_change = (modified_bev - original_bev) * 100
                     print(f"  • {scenario_name}: BEV {original_bev:.1%} → {modified_bev:.1%} ({bev_change:+.1f}%p)")
             else:
                 print(f"  ⚠️ {segment_name} 세그먼트에 해당하는 차량 데이터가 없습니다.")
-        
         return segment_results
     
     def save_segment_analysis_results(self, segment_results):
@@ -550,10 +585,11 @@ class DetailedTCOAnalyzer:
                     modified_bev = 0
                     modified_ice = 0
                     for i, vehicle_type in enumerate(modified_data['차량유형']):
-                        if vehicle_type == 'BEV':
-                            modified_bev += market_shares[i]
-                        else:
-                            modified_ice += market_shares[i]
+                        if i < len(market_shares):
+                            if vehicle_type == 'BEV':
+                                modified_bev += market_shares[i]
+                            else:
+                                modified_ice += market_shares[i]
                     
                     summary_data.append({
                         '세그먼트': segment,
@@ -613,8 +649,9 @@ class DetailedTCOAnalyzer:
                     original_bev = sum(original_data[original_data['차량유형'] == 'BEV']['현재시장점유율'])
                     modified_bev = 0
                     for i, vehicle_type in enumerate(original_data['차량유형']):
-                        if vehicle_type == 'BEV':
-                            modified_bev += market_shares[i]
+                        if i < len(market_shares):
+                            if vehicle_type == 'BEV':
+                                modified_bev += market_shares[i]
                     
                     bev_change_pct = (modified_bev - original_bev) * 100
                     
