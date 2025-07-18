@@ -61,6 +61,24 @@ class SegmentSalesAnalyzer:
         # 소유 기간 설정
         self.ownership_years = 5
         
+        # 연료별 온실가스 배출계수 (kgCO2/L)
+        self.emission_factors = {
+            '가솔린': 2.1797,
+            '디젤': 2.5950,
+            '전기': 0.0  # 전기차는 직접 배출 없음
+        }
+        
+        # 연평균 운행거리 (km/년)
+        self.annual_mileage = {
+            '승용차': 15000,
+            '소형화물': 56609,
+            '중형화물1': 70752,
+            '중형화물2': 89981,
+            '대형화물1': 166007,
+            '대형화물2': 138146,
+            '대형화물3': 103428
+        }
+        
         # 결과 저장 폴더 생성
         self.create_results_folder()
     
@@ -76,6 +94,68 @@ class SegmentSalesAnalyzer:
         
         return self.results_folder
     
+    def calculate_ghg_emissions(self, vehicle_data):
+        """온실가스 배출량 계산"""
+        emissions_data = []
+        
+        for idx, row in vehicle_data.iterrows():
+            # 차량 정보 추출
+            vehicle_name = row['차량명'] if '차량명' in row else row['소분류']
+            vehicle_type = row['차량유형']
+            main_category = row['대분류'] if '대분류' in row else '승용차'
+            fuel_efficiency = row['연비'] if '연비' in row and pd.notna(row['연비']) else 0
+            
+            # 연료 종류 결정
+            if vehicle_type == 'BEV':
+                fuel_type = '전기'
+            elif main_category == '화물':
+                fuel_type = '디젤'
+            else:
+                fuel_type = '가솔린'
+            
+            # 연평균 운행거리 결정
+            if main_category == '화물':
+                # 화물차 세부 분류에 따른 운행거리
+                sub_category = row['중분류'] if '중분류' in row else '소형화물'
+                annual_distance = self.annual_mileage.get(sub_category, 15000)
+            else:
+                annual_distance = self.annual_mileage['승용차']
+            
+            # 온실가스 배출계수
+            emission_factor = self.emission_factors.get(fuel_type, 0.0)
+            
+            # 온실가스 배출량 계산 (kgCO2/년)
+            if fuel_efficiency > 0:
+                ghg_emission = annual_distance * emission_factor / fuel_efficiency
+                # 디버깅용 출력 (모든 화물차)
+                if main_category == '화물':
+                    print(f"🔍 {vehicle_name} ({sub_category}):")
+                    print(f"   연평균운행거리: {annual_distance:,.0f} km/년")
+                    print(f"   연비: {fuel_efficiency:.1f} km/L")
+                    print(f"   배출계수: {emission_factor:.4f} kgCO2/L")
+                    print(f"   연간배출량: {ghg_emission:,.0f} kgCO2/년")
+                    print(f"   차량대수: {row['차량대수'] if '차량대수' in row else 1}")
+                    print(f"   총배출량: {ghg_emission * (row['차량대수'] if '차량대수' in row else 1):,.0f} kgCO2/년")
+                    print(f"   계산식: {annual_distance:,.0f} × {emission_factor:.4f} ÷ {fuel_efficiency:.1f} × {row['차량대수'] if '차량대수' in row else 1} = {ghg_emission * (row['차량대수'] if '차량대수' in row else 1):,.0f}")
+                    print()
+            else:
+                ghg_emission = 0.0
+            
+            emissions_data.append({
+                '차량명': vehicle_name,
+                '차량유형': vehicle_type,
+                '대분류': main_category,
+                '연료종류': fuel_type,
+                '연비': fuel_efficiency,
+                '연평균운행거리_km': annual_distance,
+                '온실가스배출계수_kgCO2_L': emission_factor,
+                '연간온실가스배출량_kgCO2': ghg_emission,
+                '차량대수': row['차량대수'] if '차량대수' in row else 1,
+                '총온실가스배출량_kgCO2': ghg_emission * (row['차량대수'] if '차량대수' in row else 1)
+            })
+        
+        return pd.DataFrame(emissions_data)
+    
     def get_segment_data(self, vehicle_data, segment):
         """특정 세그먼트의 차량 데이터 추출"""
         segment_data = vehicle_data[vehicle_data['중분류'] == segment].copy()
@@ -86,48 +166,84 @@ class SegmentSalesAnalyzer:
         # 시장점유율 계산
         total_sales = segment_data['차량대수'].sum()
         
-        # 각 차량별 시장점유율 계산
+        # 각 차량별 시장점유율 및 브랜드파워 계산
         market_shares = []
         for _, vehicle in segment_data.iterrows():
             share = vehicle['차량대수'] / total_sales if total_sales > 0 else 0
+            
+            # 브랜드파워 계산 (구매지수만 사용)
+            purchase_index = vehicle['구매지수'] if '구매지수' in vehicle and pd.notna(vehicle['구매지수']) else 0
+            brand_power = purchase_index
+            
             market_shares.append({
                 '차량명': vehicle['소분류'],
                 '차량유형': vehicle['차량유형'],
+                '차량등급': vehicle['차량등급'],
                 '현재판매량': vehicle['차량대수'],
                 '현재시장점유율': share,
                 'TCO_만원': vehicle['총TCO_만원'],
-                '초기투자비용_만원': vehicle['초기투자비용_만원']
+                '초기투자비용_만원': vehicle['초기투자비용_만원'],
+                '구매지수': purchase_index,
+                '관성계수': vehicle['관성계수'] if '관성계수' in vehicle and pd.notna(vehicle['관성계수']) else 1.0,
+                '브랜드파워': brand_power
             })
         
         return pd.DataFrame(market_shares)
     
     def calculate_choice_probability_matrix(self, segment_data):
-        """세그먼트 내 차량 간 선택 확률 매트릭스 계산"""
+        """세그먼트 내 차량 간 선택 확률 매트릭스 계산 (동일 등급 내에서만)"""
         vehicles = segment_data['차량명'].tolist()
+        vehicle_grades = segment_data['차량등급'].tolist()
         n_vehicles = len(vehicles)
         probability_matrix = np.zeros((n_vehicles, n_vehicles))
-        
+        base_probabilities = {}
         for i, vehicle_i in enumerate(vehicles):
             for j, vehicle_j in enumerate(vehicles):
-                if i != j:
-                    # vehicle_i가 vehicle_j보다 선택될 확률 계산
+                if i != j and vehicle_grades[i] == vehicle_grades[j]:
                     tco_i = segment_data.iloc[i]['TCO_만원']
                     tco_j = segment_data.iloc[j]['TCO_만원']
                     price_i = segment_data.iloc[i]['초기투자비용_만원']
                     price_j = segment_data.iloc[j]['초기투자비용_만원']
-                    
-                    # TCO 차이
                     tco_diff = tco_j - tco_i
                     avg_price = (price_i + price_j) / 2
-                    
-                    # 선택 확률 계산 (로지스틱 함수 사용)
-                    probability, _ = self.calculate_empirical_bev_probability(tco_diff, avg_price)
-                    probability_matrix[i][j] = probability
-        
-        return probability_matrix, vehicles
+                    grade_i = segment_data.iloc[i]['차량등급']
+                    grade_j = segment_data.iloc[j]['차량등급']
+                    sensitivity_i = 1.2 if grade_i == 'volume' else 0.8 if grade_i == 'premium' else 1.0
+                    sensitivity_j = 1.2 if grade_j == 'volume' else 0.8 if grade_j == 'premium' else 1.0
+                    avg_sensitivity = (sensitivity_i + sensitivity_j) / 2
+                    adjusted_tco_diff = tco_diff * avg_sensitivity
+                    purchase_index_i = segment_data.iloc[i]['구매지수'] if pd.notna(segment_data.iloc[i]['구매지수']) else 0
+                    purchase_index_j = segment_data.iloc[j]['구매지수'] if pd.notna(segment_data.iloc[j]['구매지수']) else 0
+                    brand_power_i = purchase_index_i
+                    brand_power_j = purchase_index_j
+                    base_probability, _ = self.calculate_empirical_bev_probability(adjusted_tco_diff, avg_price, brand_power_i, brand_power_j)
+                    inertia_i = segment_data.iloc[i]['관성계수'] if pd.notna(segment_data.iloc[i]['관성계수']) else 0.0
+                    inertia_j = segment_data.iloc[j]['관성계수'] if pd.notna(segment_data.iloc[j]['관성계수']) else 0.0
+                    final_probability = base_probability + inertia_j - inertia_i
+                    final_probability = np.clip(final_probability, 0, 1)
+                    probability_matrix[i][j] = final_probability
+                    base_probabilities[(i, j)] = {
+                        'base_probability': base_probability,
+                        'inertia_i': inertia_i,
+                        'inertia_j': inertia_j,
+                        'final_probability': final_probability
+                    }
+        # 각 차량별 최종 소비자 선택률 계산 (다른 차량들로부터 선택받을 확률의 평균)
+        final_choice_probabilities = []
+        for i in range(n_vehicles):
+            selection_probabilities = []
+            for j in range(n_vehicles):
+                if i != j and vehicle_grades[i] == vehicle_grades[j]:
+                    selection_probabilities.append(probability_matrix[j][i])
+            if selection_probabilities:
+                avg_selection_probability = np.mean(selection_probabilities)
+            else:
+                avg_selection_probability = 0.0
+            final_choice_probabilities.append(avg_selection_probability)
+        return probability_matrix, vehicles, final_choice_probabilities
     
-    def calculate_empirical_bev_probability(self, tco_diff, vehicle_price):
-        """PDF 기반 올바른 BEV 선택 확률 계산"""
+    def calculate_empirical_bev_probability(self, tco_diff, vehicle_price, brand_power_i=0, brand_power_j=0):
+        """PDF 기반 올바른 BEV 선택 확률 계산 (브랜드파워 추가)"""
         
         # PDF 기반 정확한 매개변수
         empirical_parameters = {
@@ -135,6 +251,7 @@ class SegmentSalesAnalyzer:
             'base_preference_constant': 0.18,  # 기본 선호도 상수
             'infrastructure_coefficient': 0.12,  # 인프라 준비도 계수
             'environmental_coefficient': 0.10,  # 환경 우려 계수
+            'brand_power_coefficient': 0.15,  # 브랜드파워 계수
         }
         
         # 1. TCO 효과 계산 (PDF 수식)
@@ -148,26 +265,31 @@ class SegmentSalesAnalyzer:
                           empirical_parameters['infrastructure_coefficient'] * infrastructure_readiness +
                           empirical_parameters['environmental_coefficient'] * environmental_concern)
         
-        # 3. 통합 불확실성 계산 (PDF 수식)
+        # 3. 브랜드파워 효과 계산 (구매지수만 사용)
+        # 브랜드파워가 높은 차량이 선택될 확률이 높아지도록 설정
+        brand_power_effect = empirical_parameters['brand_power_coefficient'] * (brand_power_j - brand_power_i)
+        
+        # 4. 통합 불확실성 계산 (PDF 수식)
         range_anxiety = 0.4
         charging_infrastructure = 0.5
         technology_uncertainty = 0.3
         uncertainty_combined = np.sqrt(range_anxiety**2 + charging_infrastructure**2 + technology_uncertainty**2)
         
-        # 4. 정규분포 불확실성 생성
+        # 5. 정규분포 불확실성 생성
         np.random.seed(42)  # 재현성을 위한 시드 설정
         uncertainty_noise = np.random.normal(0, uncertainty_combined)
         
-        # 5. 최종 확률 계산 (PDF 수식)
+        # 6. 최종 확률 계산 (TCO, 기본선호도, 불확실성, 브랜드파워)
         def sigmoid(x):
             return 1 / (1 + np.exp(-x))
         
-        combined_effect = tco_effect + base_preference + uncertainty_noise
+        combined_effect = tco_effect + base_preference + brand_power_effect + uncertainty_noise
         probability = sigmoid(combined_effect)
         
         return probability, {
             'tco_effect': tco_effect,
             'base_preference': base_preference,
+            'brand_power_effect': brand_power_effect,
             'uncertainty_combined': uncertainty_combined,
             'uncertainty_noise': uncertainty_noise,
             'combined_effect': combined_effect
@@ -209,7 +331,7 @@ class SegmentSalesAnalyzer:
                     modified_data = self.calculate_scenario_tco(scenario_segment_data)
             
             # 수정된 TCO로 선택 확률 매트릭스 재계산
-            probability_matrix, vehicles = self.calculate_choice_probability_matrix(modified_data)
+            probability_matrix, vehicles, final_choice_probabilities = self.calculate_choice_probability_matrix(modified_data)
             
             # 시장점유율 변화 계산
             market_shares = self.calculate_market_share_changes(segment_data, modified_data, probability_matrix)
@@ -220,7 +342,8 @@ class SegmentSalesAnalyzer:
                 'modified_data': modified_data,
                 'probability_matrix': probability_matrix,
                 'market_shares': market_shares,
-                'vehicles': vehicles
+                'vehicles': vehicles,
+                'final_choice_probabilities': final_choice_probabilities
             })
             
             print(f"✅ {scenario_name} 시나리오 완료")
@@ -228,10 +351,11 @@ class SegmentSalesAnalyzer:
         return results
     
     def calculate_scenario_tco(self, scenario_data):
-        """시나리오 데이터로 TCO 재계산"""
+        """시나리오 데이터로 TCO 재계산 (등급별 계수 적용)"""
         modified_data = scenario_data.copy()
         if '소분류' in modified_data.columns and '차량명' not in modified_data.columns:
             modified_data = modified_data.rename(columns={'소분류': '차량명'})
+        
         for idx, row in modified_data.iterrows():
             initial_cost = row['구매비용_만원'] - row['보조금_만원']
             annual_fuel = row['연간연료비_만원']
@@ -244,12 +368,42 @@ class SegmentSalesAnalyzer:
             residual_rate = row['잔존가치율'] if pd.notna(row['잔존가치율']) else 0.3
             residual_value = initial_cost * residual_rate
             total_tco = initial_cost + total_operating_cost - residual_value
-            modified_data.at[idx, 'TCO_만원'] = total_tco
+            
+            # 화물차 TCO 변화율 디버깅 정보 출력
+            main_category = row['대분류'] if '대분류' in row else ''
+            if main_category == '화물':
+                print(f"🔧 화물차 TCO 계산: {row['차량명'] if '차량명' in row else row['소분류']}")
+                print(f"  - 초기투자비용: {initial_cost:,.0f}만원")
+                print(f"  - 총운영비: {total_operating_cost:,.0f}만원")
+                print(f"  - 잔존가치: {residual_value:,.0f}만원")
+                print(f"  - 총TCO: {total_tco:,.0f}만원")
+            
+            # 등급별 TCO 계수 적용 (가성비 민감도 반영)
+            vehicle_grade = row['차량등급']
+            vehicle_type = row['차량유형'] if '차량유형' in row else 'ICE'
+            main_category = row['대분류'] if '대분류' in row else ''
+            
+            # 화물차는 등급별 계수 적용하지 않음 (TCO 변화율이 너무 커지는 것을 방지)
+            if main_category == '화물':
+                tco_multiplier = 1.0  # 화물차는 기본값 적용
+            elif vehicle_grade == 'volume':
+                tco_multiplier = 1.2  # volume 모델은 TCO 변화에 더 민감 (가성비 중시)
+            elif vehicle_grade == 'premium':
+                tco_multiplier = 0.8  # premium 모델은 TCO 변화에 덜 민감 (브랜드/품질 중시)
+            else:
+                tco_multiplier = 1.0  # 기본값
+            
+            # TCO에 등급별 계수 적용 (민감도 반영)
+            adjusted_tco = total_tco * tco_multiplier
+            
+            modified_data.at[idx, 'TCO_만원'] = adjusted_tco
             modified_data.at[idx, '초기투자비용_만원'] = initial_cost
             modified_data.at[idx, '연간운영비_만원'] = annual_operating_cost
             modified_data.at[idx, '총운영비_만원'] = total_operating_cost
             modified_data.at[idx, '잔존가치_만원'] = residual_value
-            modified_data.at[idx, '연평균TCO_만원'] = total_tco / self.ownership_years
+            modified_data.at[idx, '연평균TCO_만원'] = adjusted_tco / self.ownership_years
+            modified_data.at[idx, 'TCO_계수'] = tco_multiplier
+        
         return modified_data
     
     def calculate_market_share_changes(self, original_data, modified_data, probability_matrix):
@@ -282,22 +436,39 @@ class SegmentSalesAnalyzer:
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
         fig.suptitle(f'{segment_name} 세그먼트 분석 결과', fontsize=16, fontweight='bold')
         
-        # 1. 원본 TCO 비교
+        # 1. 원본 TCO 비교 (등급별 구분)
         ax1 = axes[0, 0]
         original_data = segment_results[0]['original_data']
         vehicles = original_data['차량명']
         tco_values = original_data['TCO_만원']
-        colors = ['skyblue' if x == 'ICE' else 'lightgreen' for x in original_data['차량유형']]
+        
+        # 등급별로 색상 구분
+        colors = []
+        for _, vehicle in original_data.iterrows():
+            if vehicle['차량유형'] == 'ICE':
+                if vehicle['차량등급'] == 'volume':
+                    colors.append('lightblue')
+                else:  # premium
+                    colors.append('darkblue')
+            else:  # BEV
+                if vehicle['차량등급'] == 'volume':
+                    colors.append('lightgreen')
+                else:  # premium
+                    colors.append('darkgreen')
         
         bars1 = ax1.bar(vehicles, tco_values, color=colors, alpha=0.7)
-        ax1.set_title('원본 TCO 비교')
+        ax1.set_title('원본 TCO 비교 (등급별)')
         ax1.set_ylabel('TCO (만원)')
         ax1.tick_params(axis='x', rotation=45)
         
-        # 범례 추가
+        # 범례 추가 (등급별 구분)
         from matplotlib.patches import Patch
-        legend_elements = [Patch(facecolor='skyblue', label='ICE'),
-                          Patch(facecolor='lightgreen', label='BEV')]
+        legend_elements = [
+            Patch(facecolor='lightblue', label='ICE Volume'),
+            Patch(facecolor='darkblue', label='ICE Premium'),
+            Patch(facecolor='lightgreen', label='BEV Volume'),
+            Patch(facecolor='darkgreen', label='BEV Premium')
+        ]
         ax1.legend(handles=legend_elements)
         
         # 2. 시나리오별 TCO 변화
@@ -332,22 +503,16 @@ class SegmentSalesAnalyzer:
         
         # 3. 시나리오별 시장점유율 변화
         ax3 = axes[1, 0]
-        original_shares = original_data['현재시장점유율'].values
-        
         x = np.arange(len(vehicles))
-        width = 0.15
-        
-        # 원본 시장점유율
-        ax3.bar(x - width*2, original_shares, width, label='원본', color='gray', alpha=0.7)
-        
-        # 시나리오별 시장점유율
+        width = 0.8 / len(segment_results)  # 시나리오 개수에 따라 너비 조정
+        # 원본 시장점유율 bar 제거
+        # 시나리오별 시장점유율만 표시
         for i, result in enumerate(segment_results):
             modified_shares = result['market_shares']
-            ax3.bar(x + width*i, modified_shares, width, label=result['scenario'], alpha=0.7)
-        
+            ax3.bar(x + width * i, modified_shares, width, label=result['scenario'], alpha=0.7)
         ax3.set_title('시나리오별 시장점유율 변화')
         ax3.set_ylabel('시장점유율')
-        ax3.set_xticks(x)
+        ax3.set_xticks(x + width * (len(segment_results) - 1) / 2)
         ax3.set_xticklabels(vehicles, rotation=45)
         ax3.legend()
         
@@ -355,41 +520,27 @@ class SegmentSalesAnalyzer:
         ax4 = axes[1, 1]
         bev_shares = []
         ice_shares = []
-        
         for result in segment_results:
             modified_data = result['modified_data']
             modified_shares = result['market_shares']
-            
             bev_total = 0
             ice_total = 0
-            
-            # 배열 길이 확인 및 안전한 인덱싱
             for i, vehicle_type in enumerate(modified_data['차량유형']):
-                if i < len(modified_shares):  # 배열 범위 확인
+                if i < len(modified_shares):
                     if vehicle_type == 'BEV':
                         bev_total += modified_shares[i]
                     else:
                         ice_total += modified_shares[i]
-            
             bev_shares.append(bev_total)
             ice_shares.append(ice_total)
-        
-        # 원본 BEV/ICE 비율
-        original_bev = sum(original_data[original_data['차량유형'] == 'BEV']['현재시장점유율'])
-        original_ice = sum(original_data[original_data['차량유형'] == 'ICE']['현재시장점유율'])
-        
-        scenario_names_with_original = ['원본'] + scenario_names
-        bev_shares_with_original = [original_bev] + bev_shares
-        ice_shares_with_original = [original_ice] + ice_shares
-        
-        x_pos = np.arange(len(scenario_names_with_original))
-        ax4.bar(x_pos, bev_shares_with_original, label='BEV', color='lightgreen', alpha=0.7)
-        ax4.bar(x_pos, ice_shares_with_original, bottom=bev_shares_with_original, label='ICE', color='skyblue', alpha=0.7)
-        
+        # 원본 bar 제거, 시나리오별 결과만 표시
+        x_pos = np.arange(len(scenario_names))
+        ax4.bar(x_pos, bev_shares, label='BEV', color='lightgreen', alpha=0.7)
+        ax4.bar(x_pos, ice_shares, bottom=bev_shares, label='ICE', color='skyblue', alpha=0.7)
         ax4.set_title('BEV vs ICE 시장점유율 변화')
         ax4.set_ylabel('시장점유율')
         ax4.set_xticks(x_pos)
-        ax4.set_xticklabels(scenario_names_with_original, rotation=45)
+        ax4.set_xticklabels(scenario_names, rotation=45)
         ax4.legend()
         
         plt.tight_layout()
@@ -438,6 +589,14 @@ class DetailedTCOAnalyzer:
             print("✅ Data loaded successfully.")
             print(f"📊 Total {len(self.data)} vehicle models analyzed")
             print(f"📊 Loaded scenarios: {list(self.scenarios.keys())}")
+            
+            # 소형화물 데이터 확인
+            small_cargo = self.data[self.data['중분류'] == '소형화물']
+            if not small_cargo.empty:
+                print("🔍 소형화물 데이터 확인:")
+                for idx, row in small_cargo.iterrows():
+                    print(f"  {row['소분류']}: 차량대수 {row['차량대수']:,}대, 연비 {row['연비']} km/L")
+            
             return True
         except FileNotFoundError:
             print(f"❌ File not found: {self.excel_path}")
@@ -527,12 +686,17 @@ class DetailedTCOAnalyzer:
             if not segment_data.empty:
                 print(f"  ✅ {len(segment_data)}개 차량 모델 발견:")
                 for _, vehicle in segment_data.iterrows():
-                    print(f"    • {vehicle['차량명']} ({vehicle['차량유형']}) - TCO: {vehicle['TCO_만원']:,.0f}만원")
+                    brand_power = vehicle['브랜드파워'] if '브랜드파워' in vehicle else 0
+                    print(f"    • {vehicle['차량명']} ({vehicle['차량유형']}, {vehicle['차량등급']}) - TCO: {vehicle['TCO_만원']:,.0f}만원, 브랜드파워: {brand_power:.2f}")
                 # 시나리오별 시뮬레이션
                 results = self.segment_analyzer.simulate_tco_scenarios(segment_data, scenarios)
                 segment_results[segment] = results
                 # 시각화
                 self.segment_analyzer.plot_segment_analysis(results, f"{segment}_{segment_name}")
+                
+                # 온실가스 배출량 분석 (전체 결과에서 호출)
+                # self.segment_analyzer.plot_ghg_emissions_analysis(results)
+                
                 # 결과 출력
                 print(f"\n📈 {segment_name} 세그먼트 결과 요약:")
                 original_bev = sum(segment_data[segment_data['차량유형'] == 'BEV']['현재시장점유율'])
@@ -565,134 +729,372 @@ class DetailedTCOAnalyzer:
         
         excel_filename = 'Segment_Sales_Analysis_Results.xlsx'
         excel_filepath = os.path.join(self.results_folder, excel_filename)
-        with pd.ExcelWriter(excel_filepath, engine='openpyxl') as writer:
-            
-            # 1. 세그먼트별 요약
-            summary_data = []
-            for segment, results in segment_results.items():
-                segment_name = self.segment_analyzer.segments.get(segment, segment)
+        
+        try:
+            with pd.ExcelWriter(excel_filepath, engine='openpyxl') as writer:
                 
-                for result in results:
-                    scenario_name = result['scenario']
-                    original_data = result['original_data']
-                    modified_data = result['modified_data']
-                    market_shares = result['market_shares']
-                    
-                    # BEV/ICE 점유율 변화
-                    original_bev = sum(original_data[original_data['차량유형'] == 'BEV']['현재시장점유율'])
-                    original_ice = sum(original_data[original_data['차량유형'] == 'ICE']['현재시장점유율'])
-                    
-                    modified_bev = 0
-                    modified_ice = 0
-                    for i, vehicle_type in enumerate(modified_data['차량유형']):
-                        if i < len(market_shares):
-                            if vehicle_type == 'BEV':
-                                modified_bev += market_shares[i]
-                            else:
-                                modified_ice += market_shares[i]
-                    
-                    summary_data.append({
-                        '세그먼트': segment,
-                        '세그먼트명': segment_name,
-                        '시나리오': scenario_name,
-                        '원본_BEV_점유율': original_bev,
-                        '원본_ICE_점유율': original_ice,
-                        '변화후_BEV_점유율': modified_bev,
-                        '변화후_ICE_점유율': modified_ice,
-                        'BEV_점유율_변화': modified_bev - original_bev,
-                        'ICE_점유율_변화': modified_ice - original_ice
-                    })
-            
-            summary_df = pd.DataFrame(summary_data)
-            summary_df.to_excel(writer, sheet_name='세그먼트별_요약', index=False)
-            
-            # 2. 차량별 상세 결과
-            detailed_data = []
-            for segment, results in segment_results.items():
-                segment_name = self.segment_analyzer.segments.get(segment, segment)
+                # 온실가스 배출량 분석 추가
+                self.save_ghg_emissions_analysis(segment_results, writer)
                 
-                for result in results:
-                    scenario_name = result['scenario']
-                    original_data = result['original_data']
-                    modified_data = result['modified_data']
-                    market_shares = result['market_shares']
+                # 1. 세그먼트별 요약
+                summary_data = []
+                for segment, results in segment_results.items():
+                    segment_name = self.segment_analyzer.segments.get(segment, segment)
                     
-                    for i, (_, vehicle) in enumerate(original_data.iterrows()):
-                        detailed_data.append({
+                    for result in results:
+                        scenario_name = result['scenario']
+                        original_data = result['original_data']
+                        modified_data = result['modified_data']
+                        market_shares = result['market_shares']
+                        
+                        # BEV/ICE 점유율 변화
+                        original_bev = sum(original_data[original_data['차량유형'] == 'BEV']['현재시장점유율'])
+                        original_ice = sum(original_data[original_data['차량유형'] == 'ICE']['현재시장점유율'])
+                        
+                        modified_bev = 0
+                        modified_ice = 0
+                        for i, vehicle_type in enumerate(modified_data['차량유형']):
+                            if i < len(market_shares):
+                                if vehicle_type == 'BEV':
+                                    modified_bev += market_shares[i]
+                                else:
+                                    modified_ice += market_shares[i]
+                        
+                        summary_data.append({
                             '세그먼트': segment,
                             '세그먼트명': segment_name,
                             '시나리오': scenario_name,
-                            '차량명': vehicle['차량명'],
-                            '차량유형': vehicle['차량유형'],
-                            '원본_TCO_만원': vehicle['TCO_만원'],
-                            '변화후_TCO_만원': modified_data.iloc[i]['TCO_만원'],
-                            'TCO_변화율': (modified_data.iloc[i]['TCO_만원'] - vehicle['TCO_만원']) / vehicle['TCO_만원'],
-                            '원본_시장점유율': vehicle['현재시장점유율'],
-                            '변화후_시장점유율': market_shares[i],
-                            '시장점유율_변화': market_shares[i] - vehicle['현재시장점유율']
+                            '원본_BEV_점유율': original_bev,
+                            '원본_ICE_점유율': original_ice,
+                            '변화후_BEV_점유율': modified_bev,
+                            '변화후_ICE_점유율': modified_ice,
+                            'BEV_점유율_변화': modified_bev - original_bev,
+                            'ICE_점유율_변화': modified_ice - original_ice
                         })
-            
-            detailed_df = pd.DataFrame(detailed_data)
-            detailed_df.to_excel(writer, sheet_name='차량별_상세결과', index=False)
-            
-            # 3. 시나리오별 효과 분석
-            scenario_analysis = []
-            for segment, results in segment_results.items():
-                segment_name = self.segment_analyzer.segments.get(segment, segment)
                 
-                for result in results:
-                    scenario_name = result['scenario']
-                    original_data = result['original_data']
-                    market_shares = result['market_shares']
+                if summary_data:
+                    summary_df = pd.DataFrame(summary_data)
+                    summary_df.to_excel(writer, sheet_name='세그먼트별_요약', index=False)
+                
+                # 2. 차량별 상세 결과
+                detailed_data = []
+                for segment, results in segment_results.items():
+                    segment_name = self.segment_analyzer.segments.get(segment, segment)
                     
-                    # BEV 점유율 변화
-                    original_bev = sum(original_data[original_data['차량유형'] == 'BEV']['현재시장점유율'])
-                    modified_bev = 0
-                    for i, vehicle_type in enumerate(original_data['차량유형']):
-                        if i < len(market_shares):
-                            if vehicle_type == 'BEV':
-                                modified_bev += market_shares[i]
+                    for result in results:
+                        scenario_name = result['scenario']
+                        original_data = result['original_data']
+                        modified_data = result['modified_data']
+                        market_shares = result['market_shares']
+                        
+                        for i, (_, vehicle) in enumerate(original_data.iterrows()):
+                            # 원본 차량대수
+                            if '현재판매량' in vehicle:
+                                original_count = vehicle['현재판매량']
+                            elif '차량대수' in vehicle:
+                                original_count = vehicle['차량대수']
+                            else:
+                                original_count = 0
+                            # 총판매량(원본)
+                            total_original_count = original_data['현재판매량'].sum() if '현재판매량' in original_data.columns else original_data['차량대수'].sum() if '차량대수' in original_data.columns else 0
+                            # 변화후 차량대수: 원본 총판매량 × 변화후 시장점유율
+                            changed_count = total_original_count * market_shares[i] if total_original_count > 0 else 0
+                            # 차량대수 변화
+                            count_diff = changed_count - original_count
+                            # 최종 소비자 선택률
+                            final_choice_prob = None
+                            if 'final_choice_probabilities' in result:
+                                final_choice_prob = result['final_choice_probabilities'][i]
+                            elif 'final_choice_probabilities' in locals():
+                                final_choice_prob = final_choice_probabilities[i]
+                            else:
+                                final_choice_prob = None
+                            detailed_data.append({
+                                '세그먼트': segment,
+                                '세그먼트명': segment_name,
+                                '시나리오': scenario_name,
+                                '차량명': vehicle['차량명'],
+                                '차량유형': vehicle['차량유형'],
+                                '원본_TCO_만원': vehicle['TCO_만원'],
+                                '변화후_TCO_만원': modified_data.iloc[i]['TCO_만원'],
+                                'TCO_변화율': (modified_data.iloc[i]['TCO_만원'] - vehicle['TCO_만원']) / vehicle['TCO_만원'],
+                                '원본_시장점유율': vehicle['현재시장점유율'],
+                                '변화후_시장점유율': market_shares[i],
+                                '시장점유율_변화': market_shares[i] - vehicle['현재시장점유율'],
+                                '원본_차량대수': original_count,
+                                '변화후_차량대수': changed_count,
+                                '차량대수_변화': count_diff,
+                                '최종_소비자_선택률': final_choice_prob,
+                                '구매지수': vehicle['구매지수'] if '구매지수' in vehicle else 0,
+                                '관성계수': vehicle['관성계수'] if '관성계수' in vehicle else 1.0,
+                                '브랜드파워': vehicle['브랜드파워'] if '브랜드파워' in vehicle else 0
+                            })
+                
+                if detailed_data:
+                    detailed_df = pd.DataFrame(detailed_data)
+                    detailed_df.to_excel(writer, sheet_name='차량별_상세결과', index=False)
+                
+                # 3. 시나리오별 효과 분석
+                scenario_analysis = []
+                for segment, results in segment_results.items():
+                    segment_name = self.segment_analyzer.segments.get(segment, segment)
                     
-                    bev_change_pct = (modified_bev - original_bev) * 100
+                    for result in results:
+                        scenario_name = result['scenario']
+                        original_data = result['original_data']
+                        market_shares = result['market_shares']
+                        
+                        # BEV 점유율 변화
+                        original_bev = sum(original_data[original_data['차량유형'] == 'BEV']['현재시장점유율'])
+                        modified_bev = 0
+                        for i, vehicle_type in enumerate(original_data['차량유형']):
+                            if i < len(market_shares):
+                                if vehicle_type == 'BEV':
+                                    modified_bev += market_shares[i]
+                        
+                        bev_change_pct = (modified_bev - original_bev) * 100
+                        
+                        scenario_analysis.append({
+                            '세그먼트': segment,
+                            '세그먼트명': segment_name,
+                            '시나리오': scenario_name,
+                            'BEV_점유율_변화_%p': bev_change_pct,
+                            '정책효과': '높음' if abs(bev_change_pct) > 5 else '보통' if abs(bev_change_pct) > 2 else '낮음'
+                        })
+                
+                if scenario_analysis:
+                    scenario_df = pd.DataFrame(scenario_analysis)
+                    scenario_df.to_excel(writer, sheet_name='시나리오별_효과분석', index=False)
+                
+                # 4. 세그먼트별 현황 요약
+                segment_summary = []
+                for segment in self.data['중분류'].unique():
+                    segment_data = self.data[self.data['중분류'] == segment]
+                    segment_name = self.segment_analyzer.segments.get(segment, segment)
                     
-                    scenario_analysis.append({
+                    total_sales = segment_data['차량대수'].sum()
+                    ice_sales = segment_data[segment_data['차량유형'] == 'ICE']['차량대수'].sum()
+                    bev_sales = segment_data[segment_data['차량유형'] == 'BEV']['차량대수'].sum()
+                    
+                    segment_summary.append({
                         '세그먼트': segment,
                         '세그먼트명': segment_name,
-                        '시나리오': scenario_name,
-                        'BEV_점유율_변화_%p': bev_change_pct,
-                        '정책효과': '높음' if abs(bev_change_pct) > 5 else '보통' if abs(bev_change_pct) > 2 else '낮음'
+                        '총판매량': total_sales,
+                        'ICE_판매량': ice_sales,
+                        'BEV_판매량': bev_sales,
+                        'ICE_점유율': ice_sales / total_sales if total_sales > 0 else 0,
+                        'BEV_점유율': bev_sales / total_sales if total_sales > 0 else 0,
+                        '차량모델수': len(segment_data)
                     })
-            
-            scenario_df = pd.DataFrame(scenario_analysis)
-            scenario_df.to_excel(writer, sheet_name='시나리오별_효과분석', index=False)
-            
-            # 4. 세그먼트별 현황 요약
-            segment_summary = []
-            for segment in self.data['중분류'].unique():
-                segment_data = self.data[self.data['중분류'] == segment]
-                segment_name = self.segment_analyzer.segments.get(segment, segment)
                 
-                total_sales = segment_data['차량대수'].sum()
-                ice_sales = segment_data[segment_data['차량유형'] == 'ICE']['차량대수'].sum()
-                bev_sales = segment_data[segment_data['차량유형'] == 'BEV']['차량대수'].sum()
+                if segment_summary:
+                    segment_summary_df = pd.DataFrame(segment_summary)
+                    segment_summary_df.to_excel(writer, sheet_name='세그먼트별_현황', index=False)
+            
+            print(f"✅ 세그먼트별 분석 결과가 '{excel_filepath}'에 저장되었습니다.")
+            return excel_filepath
+            
+        except Exception as e:
+            print(f"⚠️ Excel 파일 저장 중 오류 발생: {e}")
+            return None
+    
+    def save_ghg_emissions_analysis(self, segment_results, writer):
+        """온실가스 배출량 분석 결과 저장 (groupby로 중복 없이 정확히 저장)"""
+        print("\n🌍 온실가스 배출량 분석 중...")
+        
+        scenario_emissions = []
+        
+        for segment, results in segment_results.items():
+            segment_name = self.segment_analyzer.segments.get(segment, segment)
+            for result in results:
+                scenario_name = result['scenario']
+                original_data = result['original_data']
+                modified_data = result['modified_data']
+                market_shares = result['market_shares']
                 
-                segment_summary.append({
+                # 원본/수정 데이터의 온실가스 배출량 계산
+                original_emissions = self.segment_analyzer.calculate_ghg_emissions(original_data)
+                modified_emissions = self.segment_analyzer.calculate_ghg_emissions(modified_data)
+                adjusted_emissions = self.calculate_adjusted_ghg_emissions(modified_emissions, market_shares)
+                
+                # 차량유형별로 groupby 집계
+                for df, label in [(original_emissions, '원본_총온실가스배출량_kgCO2'), (adjusted_emissions, '변화후_총온실가스배출량_kgCO2')]:
+                    grouped = df.groupby('차량유형')['총온실가스배출량_kgCO2'].sum().reset_index()
+                    for _, row in grouped.iterrows():
+                        scenario_emissions.append({
+                            '세그먼트': segment,
+                            '세그먼트명': segment_name,
+                            '시나리오': scenario_name,
+                            '차량유형': row['차량유형'],
+                            label: row['총온실가스배출량_kgCO2']
+                        })
+        
+        # groupby로 동일 세그먼트/시나리오/차량유형별로 합치기
+        if scenario_emissions:
+            emissions_df = pd.DataFrame(scenario_emissions)
+            emissions_df = emissions_df.groupby(['세그먼트','세그먼트명','시나리오','차량유형'], as_index=False).sum()
+            emissions_df.to_excel(writer, sheet_name='온실가스배출량_분석', index=False)
+            print("✅ 온실가스 배출량 분석 데이터가 Excel에 저장되었습니다.")
+        else:
+            print("⚠️ 온실가스 배출량 데이터가 없습니다.")
+    
+    def calculate_adjusted_ghg_emissions(self, emissions_data, market_shares):
+        """시장점유율 변화를 반영한 온실가스 배출량 계산"""
+        adjusted_emissions = emissions_data.copy()
+        
+        for idx, row in emissions_data.iterrows():
+            if idx < len(market_shares):
+                # 시장점유율 변화에 따른 차량대수 조정
+                original_share = row['차량대수'] / emissions_data['차량대수'].sum() if emissions_data['차량대수'].sum() > 0 else 0
+                new_share = market_shares[idx]
+                
+                # 새로운 차량대수 계산
+                total_vehicles = emissions_data['차량대수'].sum()
+                new_vehicle_count = new_share * total_vehicles
+                
+                # 온실가스 배출량 조정
+                adjusted_emissions.at[idx, '차량대수'] = new_vehicle_count
+                # 연간온실가스배출량_kgCO2는 1대당 연간 배출량이므로, 새로운 차량대수를 곱함
+                adjusted_emissions.at[idx, '총온실가스배출량_kgCO2'] = row['연간온실가스배출량_kgCO2'] * new_vehicle_count
+        
+        return adjusted_emissions
+    
+    def plot_ghg_emissions_analysis(self, segment_results):
+        """온실가스 배출량 분석 시각화"""
+        print("\n📊 온실가스 배출량 분석 그래프 생성 중...")
+        
+        # 시나리오별 온실가스 배출량 데이터 수집
+        scenario_emissions = []
+        
+        for segment, results in segment_results.items():
+            segment_name = self.segment_analyzer.segments.get(segment, segment)
+            
+            for result in results:
+                scenario_name = result['scenario']
+                original_data = result['original_data']
+                modified_data = result['modified_data']
+                market_shares = result['market_shares']
+                
+                # 온실가스 배출량 계산
+                original_emissions = self.segment_analyzer.calculate_ghg_emissions(original_data)
+                modified_emissions = self.segment_analyzer.calculate_ghg_emissions(modified_data)
+                adjusted_emissions = self.calculate_adjusted_ghg_emissions(modified_emissions, market_shares)
+                
+                scenario_emissions.append({
                     '세그먼트': segment,
                     '세그먼트명': segment_name,
-                    '총판매량': total_sales,
-                    'ICE_판매량': ice_sales,
-                    'BEV_판매량': bev_sales,
-                    'ICE_점유율': ice_sales / total_sales if total_sales > 0 else 0,
-                    'BEV_점유율': bev_sales / total_sales if total_sales > 0 else 0,
-                    '차량모델수': len(segment_data)
+                    '시나리오': scenario_name,
+                    '원본_총온실가스배출량_kgCO2': original_emissions['총온실가스배출량_kgCO2'].sum(),
+                    '변화후_총온실가스배출량_kgCO2': adjusted_emissions['총온실가스배출량_kgCO2'].sum()
                 })
+        
+        if not scenario_emissions:
+            print("⚠️ 온실가스 배출량 데이터가 없습니다.")
+            return
+        
+        # 그래프 생성 - 승용차와 화물차 분리
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
+        
+        emissions_df = pd.DataFrame(scenario_emissions)
+        
+        # 대분류별 중분류 순서 정의
+        passenger_categories = ['경형', '소형', '준중형', '중형1', '중형2', '준대형', '대형1', '대형2']
+        cargo_categories = ['소형화물', '중형화물1', '중형화물2', '대형화물1', '대형화물2', '대형화물3']
+        
+        # 시나리오별 데이터 수집
+        scenarios = emissions_df['시나리오'].unique()
+        
+        # 중분류별 세부 데이터 수집
+        passenger_categories = ['경형', '소형', '준중형', '중형1', '중형2', '준대형', '대형1', '대형2']
+        cargo_categories = ['소형화물', '중형화물1', '중형화물2', '대형화물1', '대형화물2', '대형화물3']
+        
+        # 시나리오별 중분류 데이터 수집
+        scenario_detailed_data = []
+        
+        for scenario in scenarios:
+            scenario_data = emissions_df[emissions_df['시나리오'] == scenario]
             
-            segment_summary_df = pd.DataFrame(segment_summary)
-            segment_summary_df.to_excel(writer, sheet_name='세그먼트별_현황', index=False)
+            # 승용차 중분류별 데이터
+            passenger_by_category = {}
+            for category in passenger_categories:
+                category_emissions = scenario_data[scenario_data['세그먼트명'] == category]
+                passenger_by_category[category] = category_emissions['변화후_총온실가스배출량_kgCO2'].sum()
+            
+            # 화물차 중분류별 데이터
+            cargo_by_category = {}
+            for category in cargo_categories:
+                category_emissions = scenario_data[scenario_data['세그먼트명'] == category]
+                cargo_by_category[category] = category_emissions['변화후_총온실가스배출량_kgCO2'].sum()
+            
+            scenario_detailed_data.append({
+                'scenario': scenario,
+                'passenger': passenger_by_category,
+                'cargo': cargo_by_category
+            })
         
-        print(f"✅ 세그먼트별 분석 결과가 '{excel_filepath}'에 저장되었습니다.")
-        return excel_filepath
+        # 승용차 그래프 (왼쪽)
+        x = np.arange(len(scenarios))
+        width = 0.8
         
+        # 승용차 누적 막대 (중분류별 음영 변화)
+        passenger_colors = ['#FFE6E6', '#FFCCCC', '#FFB3B3', '#FF9999', '#FF8080', '#FF6666', '#FF4D4D', '#FF3333']
+        passenger_bottom = np.zeros(len(scenarios))
+        
+        for i, category in enumerate(passenger_categories):
+            category_data = [data['passenger'][category] for data in scenario_detailed_data]
+            ax1.bar(x, category_data, width, bottom=passenger_bottom, 
+                   label=category, color=passenger_colors[i], alpha=0.8)
+            passenger_bottom += np.array(category_data)
+        
+        ax1.set_title('승용차 온실가스 배출량 변화', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('온실가스 배출량 (kgCO2)', fontsize=12)
+        ax1.set_xlabel('시나리오', fontsize=12)
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(scenarios, rotation=45, ha='right')
+        ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax1.grid(True, alpha=0.3)
+        
+        # 승용차 총합 값 표시
+        for i, scenario in enumerate(scenarios):
+            passenger_total = sum([scenario_detailed_data[i]['passenger'][cat] for cat in passenger_categories])
+            ax1.text(x[i], passenger_total + passenger_total*0.01, f'{passenger_total:,.0f}', 
+                    ha='center', va='bottom', fontsize=9, fontweight='bold')
+        
+        # 화물차 그래프 (오른쪽)
+        # 화물차 누적 막대 (중분류별 음영 변화)
+        cargo_colors = ['#E6F3FF', '#CCE7FF', '#B3DBFF', '#99CFFF', '#80C3FF', '#66B7FF']
+        cargo_bottom = np.zeros(len(scenarios))
+        
+        for i, category in enumerate(cargo_categories):
+            category_data = [data['cargo'][category] for data in scenario_detailed_data]
+            ax2.bar(x, category_data, width, bottom=cargo_bottom, 
+                   label=category, color=cargo_colors[i], alpha=0.8)
+            cargo_bottom += np.array(category_data)
+        
+        ax2.set_title('화물차 온실가스 배출량 변화', fontsize=14, fontweight='bold')
+        ax2.set_ylabel('온실가스 배출량 (kgCO2)', fontsize=12)
+        ax2.set_xlabel('시나리오', fontsize=12)
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(scenarios, rotation=45, ha='right')
+        ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax2.grid(True, alpha=0.3)
+        
+        # 화물차 총합 값 표시
+        for i, scenario in enumerate(scenarios):
+            cargo_total = sum([scenario_detailed_data[i]['cargo'][cat] for cat in cargo_categories])
+            ax2.text(x[i], cargo_total + cargo_total*0.01, f'{cargo_total:,.0f}', 
+                    ha='center', va='bottom', fontsize=9, fontweight='bold')
+        
+        plt.tight_layout()
+        
+        # 결과 폴더에 저장
+        filename = '온실가스배출량_분석.png'
+        filepath = os.path.join(self.results_folder, filename)
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
+        print(f"✅ 온실가스 배출량 분석 그래프 저장 완료: {filepath}")
+        
+        return fig
+    
     def analyze_by_vehicle_model(self):
         """Detailed analysis by vehicle model"""
         print("\n" + "="*60)
@@ -1152,6 +1554,9 @@ def main():
         for segment in results.keys():
             segment_name = analyzer.segment_analyzer.segments.get(segment, segment)
             print(f"  • {segment_name} ({segment})")
+        
+        # 온실가스 배출량 분석 그래프 생성
+        analyzer.plot_ghg_emissions_analysis(results)
         
         # 결과 저장
         excel_file = analyzer.save_segment_analysis_results(results)
